@@ -1,0 +1,8 @@
+PS C:\Windows\system32> C:\Program Files\DigiCert\TLM Agent\user-scripts\vmStartStop_modified22.ps1
+At C:\Program Files\DigiCert\TLM Agent\user-scripts\vmStartStop_modified22.ps1:145 char:34
++         $desiredState = $matched ? "StoppedDeallocated" : "Started"
++                                  ~
+Unexpected token '?' in expression or statement.
+    + CategoryInfo          : ParserError: (:) [], ParentContainsErrorRecordException
+    + FullyQualifiedErrorId : UnexpectedToken
+ 
