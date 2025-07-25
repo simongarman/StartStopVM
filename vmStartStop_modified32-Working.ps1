@@ -1,0 +1,178 @@
+﻿<#
+.SYNOPSIS
+    Automates scheduled shutdown/startup of Azure VMs via "AutoShutdownSchedule" tags.
+
+.DESCRIPTION
+    Evaluates tagged schedules on VMs or resource groups, then enforces power state accordingly.
+    Use "Simulate" mode to preview actions without executing them.
+
+.PARAMETER Simulate
+    Boolean switch to enable simulation mode (no power actions performed).
+
+.INPUTS
+    None.
+
+.OUTPUTS
+    Informational and error messages for human review.
+#>
+
+param (
+    [bool]$Simulate = $false
+)
+
+$VERSION = "2.1.1"
+$currentTime = (Get-Date).ToUniversalTime()
+
+Write-Output "Runbook started. Version: $VERSION"
+
+if ($Simulate) {
+    Write-Output "*** SIMULATION MODE: No power actions will be taken ***"
+} else {
+    Write-Output "*** LIVE MODE: Power actions will be enforced ***"
+}
+
+Write-Output "Current UTC time: [$($currentTime.ToString("yyyy-MM-dd HH:mm:ss"))]"
+
+# Authenticate
+Connect-AzAccount -Identity
+Select-AzSubscription -SubscriptionId '009ccf42-7599-4656-b60a-0b0732be197d'
+
+function CheckScheduleEntry {
+    param([string]$TimeRange)
+
+    try {
+        $currentTime = (Get-Date).ToUniversalTime()
+        $midnight = $currentTime.Date.AddDays(1)
+
+        if ($TimeRange -like "*->*") {
+            $components = $TimeRange -split "->" | ForEach-Object { $_.Trim() }
+            if ($components.Count -ne 2) { return $false }
+
+            $start = Get-Date $components[0]
+            $end = Get-Date $components[1]
+
+            if ($start -gt $end) {
+                $end = $end.AddDays(1)
+                $start = $start.AddDays(-1)
+            }
+
+            return ($currentTime -ge $start -and $currentTime -le $end)
+        }
+
+        if ([System.DayOfWeek]::GetValues([System.DayOfWeek]) -contains $TimeRange) {
+            return ($TimeRange -eq $currentTime.DayOfWeek)
+        }
+
+        $day = Get-Date $TimeRange
+        return ($currentTime.Date -eq $day.Date)
+    }
+    catch {
+        Write-Output "WARNING: Failed to parse time range [$TimeRange]: $($_.Exception.Message)"
+        return $false
+    }
+}
+
+function AssertPowerState {
+    param (
+        $vm,
+        [string]$DesiredState,
+        $resourceManagerVMList,
+        $classicVMList,
+        [bool]$Simulate
+    )
+
+    if ($vm.ResourceType -eq "Microsoft.ClassicCompute/virtualMachines") {
+        $classicVM = $classicVMList | Where-Object { $_.Name -eq $vm.Name }
+
+        if ($DesiredState -eq "Started") {
+            if ($classicVM.PowerState -notmatch "Started|Starting") {
+                if ($Simulate) {
+                    Write-Output "[$($vm.Name)] SIMULATION -- Would start Classic VM"
+                } else {
+                    $classicVM | Start-AzVM
+                }
+            }
+        }
+        elseif ($DesiredState -eq "StoppedDeallocated") {
+            if ($classicVM.PowerState -ne "Stopped") {
+                if ($Simulate) {
+                    Write-Output "[$($vm.Name)] SIMULATION -- Would stop Classic VM"
+                } else {
+                    $classicVM | Stop-AzVM -Force
+                }
+            }
+        }
+    }
+    elseif ($vm.ResourceType -eq "Microsoft.Compute/virtualMachines") {
+        $status = (Get-AzVM -ResourceGroupName $vm.ResourceGroupName -Name $vm.Name -Status).Statuses |
+                  Where-Object { $_.Code -like "PowerState*" } |
+                  Select-Object -First 1
+        $state = $status.Code -replace "PowerState/", ""
+
+        if ($DesiredState -eq "Started" -and $state -ne "running") {
+            if ($Simulate) {
+                Write-Output "[$($vm.Name)] SIMULATION -- Would start VM"
+            } else {
+                $vm | Start-AzVM
+            }
+        }
+        elseif ($DesiredState -eq "StoppedDeallocated" -and $state -ne "deallocated") {
+            if ($Simulate) {
+                Write-Output "[$($vm.Name)] SIMULATION -- Would stop VM"
+            } else {
+                $vm | Stop-AzVM -Force
+            }
+        }
+    }
+    else {
+        Write-Output "[$($vm.Name)] VM type not recognized: [$($vm.ResourceType)]. Skipping."
+    }
+}
+
+try {
+    $resourceManagerVMList = Get-AzResource | Where-Object { $_.ResourceType -like "Microsoft.*/virtualMachines" } | Sort-Object Name
+    $classicVMList = Get-AzVM
+    $taggedGroups = Get-AzResourceGroup | Where-Object { $_.Tags["AutoShutdownSchedule"] }
+
+    foreach ($vm in $resourceManagerVMList) {
+        $schedule = $null
+
+        if ($vm.Tags["AutoShutdownSchedule"]) {
+            $schedule = $vm.Tags["AutoShutdownSchedule"]
+        }
+        elseif ($taggedGroups | Where-Object { $_.ResourceGroupName -eq $vm.ResourceGroupName }) {
+            $group = $taggedGroups | Where-Object { $_.ResourceGroupName -eq $vm.ResourceGroupName }
+            $schedule = $group.Tags["AutoShutdownSchedule"]
+        }
+
+        if (-not $schedule) {
+            Write-Output "[$($vm.Name)] No schedule tag found. Skipping."
+            continue
+        }
+
+        $ranges = $schedule -split "," | ForEach-Object { $_.Trim() }
+        $matched = $false
+
+        foreach ($r in $ranges) {
+            if (CheckScheduleEntry -TimeRange $r) {
+                $matched = $true
+                break
+            }
+        }
+
+        if ($matched) {
+            $desiredState = "StoppedDeallocated"
+        } else {
+            $desiredState = "Started"
+        }
+        AssertPowerState -vm $vm -DesiredState $desiredState -resourceManagerVMList $resourceManagerVMList -classicVMList $classicVMList -Simulate $Simulate
+    }
+}
+catch {
+    throw "Unexpected error: $($_.Exception.Message)"
+}
+finally {
+    $endTime = (Get-Date).ToUniversalTime()
+    $duration = $endTime - $currentTime
+    Write-Output "Runbook completed in $($duration.ToString("hh\:mm\:ss"))"
+}
